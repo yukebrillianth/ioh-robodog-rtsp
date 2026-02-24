@@ -199,10 +199,14 @@ bool Pipeline::build_encoder_pipeline() {
         NULL);
 
     // ---- Configure decoder ----
+    // Note: disable-dpb not used — unreliable on GStreamer 1.16
     g_object_set(G_OBJECT(decoder),
         "enable-max-performance", TRUE,
-        "disable-dpb",           TRUE,
         NULL);
+
+    // ---- Configure input h264parse ----
+    // Ensure SPS/PPS is always inline so decoder can detect stream format
+    g_object_set(G_OBJECT(parse_in), "config-interval", -1, NULL);
 
     // ---- Configure encoder ----
     encoder_.configure(encoder,
@@ -244,16 +248,13 @@ bool Pipeline::build_encoder_pipeline() {
         return false;
     }
 
-    // parse_in → decoder (with explicit byte-stream caps)
-    GstCaps* h264_caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
-    if (!gst_element_link_filtered(parse_in, decoder, h264_caps)) {
-        std::cerr << "[ENCODER] Failed to link parse_in → decoder with caps" << std::endl;
-        gst_caps_unref(h264_caps);
+    // parse_in → decoder (let them auto-negotiate caps — GStreamer 1.16 compat)
+    if (!gst_element_link(parse_in, decoder)) {
+        std::cerr << "[ENCODER] Failed to link parse_in → decoder" << std::endl;
         gst_object_unref(enc_pipeline_);
         enc_pipeline_ = nullptr;
         return false;
     }
-    gst_caps_unref(h264_caps);
 
     // decoder → vidconv
     if (!gst_element_link(decoder, vidconv)) {
@@ -263,14 +264,15 @@ bool Pipeline::build_encoder_pipeline() {
         return false;
     }
 
-    // vidconv → encoder (with resolution/framerate caps on NVMM memory)
+    // vidconv → encoder (with resolution caps on NVMM memory)
+    // NOTE: Do NOT specify framerate here — decoder outputs framerate=0/1
+    // (variable) and a forced 30/1 will block caps negotiation.
     {
         std::ostringstream caps_ss;
         caps_ss << "video/x-raw(memory:NVMM)"
                 << ",format=NV12"
                 << ",width=" << config_.encoder.width
-                << ",height=" << config_.encoder.height
-                << ",framerate=" << config_.encoder.framerate << "/1";
+                << ",height=" << config_.encoder.height;
         GstCaps* raw_caps = gst_caps_from_string(caps_ss.str().c_str());
         if (!gst_element_link_filtered(vidconv, encoder, raw_caps)) {
             std::cerr << "[ENCODER] Failed to link vidconv → encoder with caps: "
