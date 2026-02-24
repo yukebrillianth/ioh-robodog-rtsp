@@ -11,7 +11,6 @@
 #include <atomic>
 #include <mutex>
 #include <string>
-#include <vector>
 
 /// Manages two GStreamer pipelines bridged via appsink→appsrc:
 ///
@@ -51,11 +50,10 @@ public:
     /// Update bitrate at runtime.
     void set_bitrate(uint32_t target_kbps, uint32_t max_kbps);
 
-    /// Get the latest H.264 sample (for RTSP server factory).
-    /// Returns nullptr if no sample available.
+    /// Pull a sample from the encoder (used by RTSP server feeder).
     GstSample* pull_latest_sample();
 
-    /// Get the cached SPS/PPS caps string for appsrc.
+    /// Get the cached caps string for appsrc.
     std::string get_caps_string() const;
 
     /// Check if we have valid caps from the encoder.
@@ -83,7 +81,7 @@ private:
 
     int reconnect_delay_s_ = 3;
 
-    /// Build the encoder pipeline.
+    /// Build the encoder pipeline with individual elements.
     bool build_encoder_pipeline();
 
     /// Start the RTSP server with a custom factory.
@@ -96,11 +94,8 @@ private:
     void stop_rtsp_server();
 
     // ---- GStreamer Callbacks ----
-    /// Called when rtspsrc creates a new pad (dynamic pad linking).
-    static void on_pad_added(GstElement* src, GstPad* new_pad, gpointer data);
-
-    /// Called when a new sample is available from appsink.
-    static GstFlowReturn on_new_sample(GstAppSink* sink, gpointer data);
+    /// Called when rtspsrc creates a new dynamic pad — links to rtph264depay.
+    static void on_pad_added(GstElement* src, GstPad* new_pad, gpointer depay);
 
     /// Handle bus messages (error, EOS, state changes).
     static gboolean on_bus_message(GstBus* bus, GstMessage* msg, gpointer data);
@@ -110,10 +105,6 @@ private:
 // Custom RTSP Media Factory
 // ============================================================================
 
-/// A custom GstRTSPMediaFactory that serves H.264 from our encoder pipeline.
-/// It creates an appsrc-based pipeline and feeds it from the encoder's appsink.
-
-// Forward declare
 #define TYPE_ENCODER_FACTORY (encoder_factory_get_type())
 G_DECLARE_FINAL_TYPE(EncoderFactory, encoder_factory, ENCODER, FACTORY, GstRTSPMediaFactory)
 
