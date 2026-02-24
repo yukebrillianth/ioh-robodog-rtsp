@@ -74,7 +74,7 @@ void Stats::print() const {
 
     double since_last = seconds_since_last_frame();
 
-    std::cout << "[STATS] uptime=" << get_uptime_string()
+    std::cerr << "[STATS] uptime=" << get_uptime_string()
               << " | frames=" << current_frames
               << " | fps=" << std::fixed << std::setprecision(1) << fps
               << " | last_frame=" << std::fixed << std::setprecision(1) << since_last << "s ago"

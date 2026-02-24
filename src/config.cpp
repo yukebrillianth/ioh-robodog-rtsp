@@ -118,3 +118,15 @@ void print_config(const AppConfig& cfg) {
     std::cout << "  Watchdog:     " << cfg.resilience.watchdog_timeout_s << "s" << std::endl;
     std::cout << "========================================" << std::endl;
 }
+
+void print_config_stderr(const AppConfig& cfg) {
+    std::cerr << "  Source:     " << cfg.rtsp.url << std::endl;
+    std::cerr << "  Transport:  " << cfg.rtsp.transport << std::endl;
+    std::cerr << "  Latency:    " << cfg.rtsp.latency_ms << " ms" << std::endl;
+    std::cerr << "  Resolution: " << cfg.encoder.width << "x" << cfg.encoder.height << std::endl;
+    std::cerr << "  Bitrate:    " << cfg.encoder.target_bitrate_kbps << " / "
+              << cfg.encoder.max_bitrate_kbps << " kbps" << std::endl;
+    std::cerr << "  IDR:        " << cfg.encoder.idr_interval << " frames" << std::endl;
+    std::cerr << "  Preset:     " << cfg.encoder.preset << std::endl;
+    std::cerr << "  Profile:    " << cfg.encoder.profile << std::endl;
+}

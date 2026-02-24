@@ -5,8 +5,11 @@
 #include <chrono>
 #include <cstring>
 
+// All output to stderr (stdout reserved for H.264 data in exec mode)
+#define LOG(msg) std::cerr << msg << std::endl
+
 // ============================================================================
-//  Custom RTSP Media Factory (GObject boilerplate)
+//  Custom RTSP Media Factory (only used in RTSP mode)
 // ============================================================================
 
 G_DEFINE_TYPE(EncoderFactory, encoder_factory, GST_TYPE_RTSP_MEDIA_FACTORY)
@@ -19,108 +22,77 @@ static void encoder_factory_class_init(EncoderFactoryClass* klass) {
     factory_class->create_element = encoder_factory_create_element;
 }
 
-static void encoder_factory_init(EncoderFactory* /*self*/) {
-    // Nothing to init
-}
+static void encoder_factory_init(EncoderFactory*) {}
 
 GstRTSPMediaFactory* encoder_factory_new(Pipeline* pipeline) {
     EncoderFactory* factory = (EncoderFactory*)g_object_new(TYPE_ENCODER_FACTORY, NULL);
     factory->pipeline = pipeline;
-
-    // Shared: all clients see the same stream
     gst_rtsp_media_factory_set_shared(GST_RTSP_MEDIA_FACTORY(factory), TRUE);
-
     return GST_RTSP_MEDIA_FACTORY(factory);
 }
 
-/// Called by GstRTSPServer when a client connects: creates the serving pipeline.
-/// Pipeline: appsrc → h264parse → rtph264pay
 static GstElement* encoder_factory_create_element(GstRTSPMediaFactory* factory,
-                                                    const GstRTSPUrl* /*url*/) {
+                                                    const GstRTSPUrl*) {
     EncoderFactory* self = ENCODER_FACTORY(factory);
     Pipeline* pipeline = self->pipeline;
 
-    std::cout << "[RTSP-SERVER] Client connected, creating serve pipeline..." << std::endl;
+    LOG("[RTSP-SERVER] Client connected, creating serve pipeline...");
 
-    // Create the serving bin
     GstElement* bin = gst_bin_new("serve-bin");
-
-    // appsrc: receives H.264 encoded buffers from encoder pipeline
     GstElement* appsrc = gst_element_factory_make("appsrc", "appsrc0");
     GstElement* h264parse = gst_element_factory_make("h264parse", "parse0");
     GstElement* pay = gst_element_factory_make("rtph264pay", "pay0");
 
     if (!appsrc || !h264parse || !pay) {
-        std::cerr << "[RTSP-SERVER] Failed to create serve pipeline elements" << std::endl;
+        LOG("[RTSP-SERVER] Failed to create serve pipeline elements");
         gst_object_unref(bin);
         return nullptr;
     }
 
-    // Configure appsrc
-    // Set caps for H.264 byte-stream
-    GstCaps* caps = gst_caps_from_string(
-        "video/x-h264,stream-format=byte-stream,alignment=au");
+    GstCaps* caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
     g_object_set(G_OBJECT(appsrc),
-        "is-live", TRUE,
-        "format", GST_FORMAT_TIME,
-        "do-timestamp", TRUE,
-        "block", FALSE,
-        "max-bytes", (guint64)(2 * 1024 * 1024),  // 2MB buffer
-        "caps", caps,
-        NULL);
+        "is-live", TRUE, "format", GST_FORMAT_TIME, "do-timestamp", TRUE,
+        "block", FALSE, "max-bytes", (guint64)(2 * 1024 * 1024), "caps", caps, NULL);
     gst_caps_unref(caps);
 
-    // Configure h264parse to output config with every IDR
     g_object_set(G_OBJECT(h264parse), "config-interval", -1, NULL);
-
-    // Configure rtph264pay for low latency
     g_object_set(G_OBJECT(pay), "config-interval", -1, "pt", 96, NULL);
 
-    // Add to bin and link
     gst_bin_add_many(GST_BIN(bin), appsrc, h264parse, pay, NULL);
     if (!gst_element_link_many(appsrc, h264parse, pay, NULL)) {
-        std::cerr << "[RTSP-SERVER] Failed to link serve pipeline" << std::endl;
+        LOG("[RTSP-SERVER] Failed to link serve pipeline");
         gst_object_unref(bin);
         return nullptr;
     }
 
-    // NOTE: Do NOT manually create ghost pads here.
-    // GstRTSPServer automatically discovers elements named "pay0", "pay1", etc.
-    // and creates the appropriate ghost pads + RTSP streams from them.
-
-    // Start a feeder thread: pull from encoder appsink, push to this appsrc
+    // Feeder thread
     gst_object_ref(appsrc);
-
-    std::thread feeder([pipeline, appsrc]() {
-        std::cout << "[RTSP-SERVER] Feeder thread started" << std::endl;
+    std::thread([pipeline, appsrc]() {
+        LOG("[RTSP-SERVER] Feeder thread started");
         while (pipeline->is_running()) {
             GstSample* sample = pipeline->pull_latest_sample();
             if (sample) {
                 GstBuffer* buffer = gst_sample_get_buffer(sample);
                 if (buffer) {
-                    GstBuffer* buf_copy = gst_buffer_copy(buffer);
-                    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), buf_copy);
-                    if (ret != GST_FLOW_OK) {
-                        gst_sample_unref(sample);
-                        break;
-                    }
+                    GstBuffer* copy = gst_buffer_copy(buffer);
+                    GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc), copy);
+                    if (ret != GST_FLOW_OK) { gst_sample_unref(sample); break; }
                 }
                 gst_sample_unref(sample);
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
         }
-        std::cout << "[RTSP-SERVER] Feeder thread stopped" << std::endl;
+        LOG("[RTSP-SERVER] Feeder thread stopped");
         gst_object_unref(appsrc);
-    });
-    feeder.detach();
+    }).detach();
 
-    std::cout << "[RTSP-SERVER] Serve pipeline created successfully" << std::endl;
+    LOG("[RTSP-SERVER] Serve pipeline created");
     return bin;
 }
 
 // ============================================================================
-//  Pipeline Implementation
+//  Pipeline
 // ============================================================================
 
 Pipeline::Pipeline(const AppConfig& config, Stats& stats)
@@ -128,84 +100,63 @@ Pipeline::Pipeline(const AppConfig& config, Stats& stats)
     reconnect_delay_s_ = config_.rtsp.reconnect_delay_s;
 }
 
-Pipeline::~Pipeline() {
-    stop();
-}
+Pipeline::~Pipeline() { stop(); }
 
-// ============================================================================
-//  Encoder Pipeline
-// ============================================================================
-
-/// Buffer probe callback for frame counting on appsink's sink pad.
-/// Runs in the streaming thread — must be fast.
-static GstPadProbeReturn frame_count_probe(GstPad* /*pad*/,
-                                            GstPadProbeInfo* /*info*/,
-                                            gpointer user_data) {
-    Stats* stats = static_cast<Stats*>(user_data);
-    stats->on_frame_encoded();
+// Buffer probe for frame counting
+static GstPadProbeReturn frame_count_probe(GstPad*, GstPadProbeInfo*, gpointer user_data) {
+    static_cast<Stats*>(user_data)->on_frame_encoded();
     return GST_PAD_PROBE_OK;
 }
 
-bool Pipeline::build_encoder_pipeline() {
+// ============================================================================
+//  Shared pipeline builder — creates everything from rtspsrc to encoder output
+//  then attaches the provided sink_element at the end
+// ============================================================================
+
+bool Pipeline::build_pipeline_common(GstElement*& pipeline, GstElement* sink_element) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Build pipeline elements individually for proper dynamic pad handling
-    // rtspsrc → rtph264depay → h264parse → (caps) → nvv4l2decoder → nvvidconv → (caps) → nvv4l2h264enc → h264parse → appsink
+    pipeline = gst_pipeline_new("encoder-pipeline");
+    if (!pipeline) { LOG("[ENCODER] Failed to create pipeline"); return false; }
 
-    enc_pipeline_ = gst_pipeline_new("encoder-pipeline");
-    if (!enc_pipeline_) {
-        std::cerr << "[ENCODER] Failed to create pipeline" << std::endl;
-        return false;
-    }
+    GstElement* rtspsrc   = gst_element_factory_make("rtspsrc",       "src");
+    GstElement* depay     = gst_element_factory_make("rtph264depay",  "depay");
+    GstElement* parse_in  = gst_element_factory_make("h264parse",     "parse_in");
+    GstElement* decoder   = gst_element_factory_make("nvv4l2decoder", "decoder");
+    GstElement* vidconv   = gst_element_factory_make("nvvidconv",     "vidconv");
+    GstElement* encoder   = gst_element_factory_make("nvv4l2h264enc", "encoder");
+    GstElement* parse_out = gst_element_factory_make("h264parse",     "parse_out");
 
-    // Create elements
-    GstElement* rtspsrc     = gst_element_factory_make("rtspsrc",       "src");
-    GstElement* depay       = gst_element_factory_make("rtph264depay",  "depay");
-    GstElement* parse_in    = gst_element_factory_make("h264parse",     "parse_in");
-    GstElement* decoder     = gst_element_factory_make("nvv4l2decoder", "decoder");
-    GstElement* vidconv     = gst_element_factory_make("nvvidconv",     "vidconv");
-    GstElement* encoder     = gst_element_factory_make("nvv4l2h264enc", "encoder");
-    GstElement* parse_out   = gst_element_factory_make("h264parse",     "parse_out");
-    GstElement* sink        = gst_element_factory_make("appsink",       "enc_sink");
-
-    // Verify all elements created
     if (!rtspsrc || !depay || !parse_in || !decoder || !vidconv ||
-        !encoder || !parse_out || !sink) {
-        std::cerr << "[ENCODER] Failed to create one or more elements. Check GStreamer plugins:" << std::endl;
-        if (!rtspsrc)   std::cerr << "  - rtspsrc missing (gst-plugins-good)" << std::endl;
-        if (!depay)     std::cerr << "  - rtph264depay missing (gst-plugins-good)" << std::endl;
-        if (!decoder)   std::cerr << "  - nvv4l2decoder missing (nvidia-l4t-gstreamer)" << std::endl;
-        if (!vidconv)   std::cerr << "  - nvvidconv missing (nvidia-l4t-gstreamer)" << std::endl;
-        if (!encoder)   std::cerr << "  - nvv4l2h264enc missing (nvidia-l4t-gstreamer)" << std::endl;
-        if (!sink)      std::cerr << "  - appsink missing (gst-plugins-base)" << std::endl;
-        gst_object_unref(enc_pipeline_);
-        enc_pipeline_ = nullptr;
+        !encoder || !parse_out || !sink_element) {
+        LOG("[ENCODER] Failed to create elements. Check GStreamer plugins.");
+        if (!rtspsrc)   LOG("  - rtspsrc missing");
+        if (!decoder)   LOG("  - nvv4l2decoder missing (nvidia-l4t-gstreamer)");
+        if (!vidconv)   LOG("  - nvvidconv missing");
+        if (!encoder)   LOG("  - nvv4l2h264enc missing");
+        gst_object_unref(pipeline); pipeline = nullptr;
         return false;
     }
 
-    // ---- Configure rtspsrc ----
+    // Configure rtspsrc
     g_object_set(G_OBJECT(rtspsrc),
-        "location",           config_.rtsp.url.c_str(),
-        "protocols",          (config_.rtsp.transport == "tcp") ? 4 : 1,  // GST_RTSP_LOWER_TRANS_TCP=4, UDP=1
-        "latency",            (guint)config_.rtsp.latency_ms,
-        "tcp-timeout",        (guint64)5000000,   // 5 sec
-        "retry",              (guint)5,
-        "do-retransmission",  FALSE,
-        "drop-on-latency",    TRUE,
-        "ntp-sync",           FALSE,
+        "location",          config_.rtsp.url.c_str(),
+        "protocols",         (config_.rtsp.transport == "tcp") ? 4 : 1,
+        "latency",           (guint)config_.rtsp.latency_ms,
+        "tcp-timeout",       (guint64)5000000,
+        "retry",             (guint)5,
+        "do-retransmission", FALSE,
+        "drop-on-latency",   TRUE,
+        "ntp-sync",          FALSE,
         NULL);
 
-    // ---- Configure decoder ----
-    // Note: disable-dpb not used — unreliable on GStreamer 1.16
-    g_object_set(G_OBJECT(decoder),
-        "enable-max-performance", TRUE,
-        NULL);
+    // Configure decoder
+    g_object_set(G_OBJECT(decoder), "enable-max-performance", TRUE, NULL);
 
-    // ---- Configure input h264parse ----
-    // Ensure SPS/PPS is always inline so decoder can detect stream format
+    // h264parse: inline SPS/PPS for decoder
     g_object_set(G_OBJECT(parse_in), "config-interval", -1, NULL);
 
-    // ---- Configure encoder ----
+    // Configure NVENC encoder
     encoder_.configure(encoder,
                        config_.encoder.target_bitrate_kbps,
                        config_.encoder.max_bitrate_kbps,
@@ -214,218 +165,115 @@ bool Pipeline::build_encoder_pipeline() {
                        config_.encoder.profile,
                        config_.encoder.control_rate);
 
-    // ---- Configure output parse ----
+    // Output h264parse: inject SPS/PPS with every IDR for fast stream start
     g_object_set(G_OBJECT(parse_out), "config-interval", -1, NULL);
 
-    // ---- Configure appsink ----
-    // No signal needed — feeder thread uses try_pull_sample
-    // Frame counting done via pad probe (no conflict)
-    GstCaps* sink_caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
-    g_object_set(G_OBJECT(sink),
-        "emit-signals", FALSE,
-        "sync",         FALSE,
-        "max-buffers",  (guint)3,
-        "drop",         TRUE,
-        "caps",         sink_caps,
-        NULL);
-    gst_caps_unref(sink_caps);
-    appsink_ = sink;
-
-    // ---- Add all elements to pipeline ----
-    gst_bin_add_many(GST_BIN(enc_pipeline_),
-        rtspsrc, depay, parse_in, decoder, vidconv, encoder, parse_out, sink,
+    // Add all to pipeline
+    gst_bin_add_many(GST_BIN(pipeline),
+        rtspsrc, depay, parse_in, decoder, vidconv, encoder, parse_out, sink_element,
         NULL);
 
-    // ---- Link static elements: depay → parse_in → decoder → vidconv → encoder → parse_out → sink ----
-    // depay → parse_in
+    // Link: depay → parse_in
     if (!gst_element_link(depay, parse_in)) {
-        std::cerr << "[ENCODER] Failed to link depay → parse_in" << std::endl;
-        gst_object_unref(enc_pipeline_);
-        enc_pipeline_ = nullptr;
-        return false;
+        LOG("[ENCODER] Link failed: depay → parse_in");
+        gst_object_unref(pipeline); pipeline = nullptr; return false;
     }
 
-    // parse_in → decoder (let them auto-negotiate caps — GStreamer 1.16 compat)
+    // parse_in → decoder (auto-negotiate)
     if (!gst_element_link(parse_in, decoder)) {
-        std::cerr << "[ENCODER] Failed to link parse_in → decoder" << std::endl;
-        gst_object_unref(enc_pipeline_);
-        enc_pipeline_ = nullptr;
-        return false;
+        LOG("[ENCODER] Link failed: parse_in → decoder");
+        gst_object_unref(pipeline); pipeline = nullptr; return false;
     }
 
     // decoder → vidconv
     if (!gst_element_link(decoder, vidconv)) {
-        std::cerr << "[ENCODER] Failed to link decoder → vidconv" << std::endl;
-        gst_object_unref(enc_pipeline_);
-        enc_pipeline_ = nullptr;
-        return false;
+        LOG("[ENCODER] Link failed: decoder → vidconv");
+        gst_object_unref(pipeline); pipeline = nullptr; return false;
     }
 
-    // vidconv → encoder (with resolution caps on NVMM memory)
-    // NOTE: Do NOT specify framerate here — decoder outputs framerate=0/1
-    // (variable) and a forced 30/1 will block caps negotiation.
+    // vidconv → encoder (with NVMM caps, NO framerate — decoder outputs 0/1)
     {
-        std::ostringstream caps_ss;
-        caps_ss << "video/x-raw(memory:NVMM)"
-                << ",format=NV12"
-                << ",width=" << config_.encoder.width
-                << ",height=" << config_.encoder.height;
-        GstCaps* raw_caps = gst_caps_from_string(caps_ss.str().c_str());
-        if (!gst_element_link_filtered(vidconv, encoder, raw_caps)) {
-            std::cerr << "[ENCODER] Failed to link vidconv → encoder with caps: "
-                      << caps_ss.str() << std::endl;
-            gst_caps_unref(raw_caps);
-            gst_object_unref(enc_pipeline_);
-            enc_pipeline_ = nullptr;
-            return false;
+        std::ostringstream ss;
+        ss << "video/x-raw(memory:NVMM),format=NV12"
+           << ",width=" << config_.encoder.width
+           << ",height=" << config_.encoder.height;
+        GstCaps* caps = gst_caps_from_string(ss.str().c_str());
+        if (!gst_element_link_filtered(vidconv, encoder, caps)) {
+            LOG("[ENCODER] Link failed: vidconv → encoder with caps: " << ss.str());
+            gst_caps_unref(caps);
+            gst_object_unref(pipeline); pipeline = nullptr; return false;
         }
-        gst_caps_unref(raw_caps);
+        gst_caps_unref(caps);
     }
 
-    // encoder → parse_out → sink
-    // Force byte-stream output from encoder
-    GstCaps* enc_out_caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream");
-    if (!gst_element_link_filtered(encoder, parse_out, enc_out_caps)) {
-        std::cerr << "[ENCODER] Failed to link encoder → parse_out" << std::endl;
-        gst_caps_unref(enc_out_caps);
-        gst_object_unref(enc_pipeline_);
-        enc_pipeline_ = nullptr;
-        return false;
+    // encoder → parse_out (byte-stream)
+    GstCaps* enc_caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream");
+    if (!gst_element_link_filtered(encoder, parse_out, enc_caps)) {
+        LOG("[ENCODER] Link failed: encoder → parse_out");
+        gst_caps_unref(enc_caps);
+        gst_object_unref(pipeline); pipeline = nullptr; return false;
     }
-    gst_caps_unref(enc_out_caps);
+    gst_caps_unref(enc_caps);
 
-    if (!gst_element_link(parse_out, sink)) {
-        std::cerr << "[ENCODER] Failed to link parse_out → sink" << std::endl;
-        gst_object_unref(enc_pipeline_);
-        enc_pipeline_ = nullptr;
-        return false;
+    // parse_out → sink_element
+    if (!gst_element_link(parse_out, sink_element)) {
+        LOG("[ENCODER] Link failed: parse_out → sink");
+        gst_object_unref(pipeline); pipeline = nullptr; return false;
     }
 
-    // ---- Handle rtspsrc dynamic pads ----
-    // rtspsrc creates pads dynamically when RTSP DESCRIBE/SETUP completes
-    // We connect to "pad-added" to link rtspsrc → depay when the video pad appears
+    // Dynamic pad linking for rtspsrc
     g_signal_connect(rtspsrc, "pad-added", G_CALLBACK(Pipeline::on_pad_added), depay);
 
-    // ---- Frame count probe on appsink's sink pad ----
-    GstPad* sink_pad = gst_element_get_static_pad(sink, "sink");
+    // Frame count probe
+    GstPad* sink_pad = gst_element_get_static_pad(sink_element, "sink");
     if (sink_pad) {
         gst_pad_add_probe(sink_pad, GST_PAD_PROBE_TYPE_BUFFER,
                           frame_count_probe, &stats_, NULL);
         gst_object_unref(sink_pad);
     }
 
-    // ---- Bus watch ----
-    enc_bus_ = gst_element_get_bus(enc_pipeline_);
+    // Bus watch
+    enc_bus_ = gst_element_get_bus(pipeline);
     gst_bus_add_watch(enc_bus_, Pipeline::on_bus_message, this);
 
-    std::cout << "[ENCODER] Pipeline built successfully" << std::endl;
+    LOG("[ENCODER] Pipeline built OK");
     return true;
 }
 
-void Pipeline::stop_encoder() {
-    if (enc_pipeline_) {
-        gst_element_set_state(enc_pipeline_, GST_STATE_NULL);
+// ============================================================================
+//  STDOUT MODE — output H.264 byte-stream directly to fd=1 (stdout)
+//  Zero buffering, go2rtc reads directly via exec:
+// ============================================================================
 
-        if (enc_bus_) {
-            gst_bus_remove_watch(enc_bus_);
-            gst_object_unref(enc_bus_);
-            enc_bus_ = nullptr;
-        }
-
-        // Don't unref appsink separately — it's owned by the pipeline
-        appsink_ = nullptr;
-
-        gst_object_unref(enc_pipeline_);
-        enc_pipeline_ = nullptr;
+bool Pipeline::build_stdout_pipeline() {
+    GstElement* fdsink = gst_element_factory_make("fdsink", "stdout_sink");
+    if (!fdsink) {
+        LOG("[ENCODER] Failed to create fdsink");
+        return false;
     }
+
+    // fd=1 = stdout, sync=false = don't throttle to clock (real-time output)
+    g_object_set(G_OBJECT(fdsink),
+        "fd", 1,
+        "sync", FALSE,
+        NULL);
+
+    return build_pipeline_common(enc_pipeline_, fdsink);
 }
 
-// ============================================================================
-//  RTSP Server
-// ============================================================================
+bool Pipeline::start_stdout_mode() {
+    if (running_.load()) { LOG("[PIPELINE] Already running"); return false; }
 
-bool Pipeline::start_rtsp_server() {
-    rtsp_server_ = gst_rtsp_server_new();
-    if (!rtsp_server_) {
-        std::cerr << "[RTSP-SERVER] Failed to create server" << std::endl;
+    stdout_mode_ = true;
+
+    if (!build_stdout_pipeline()) {
+        LOG("[PIPELINE] Failed to build stdout pipeline");
         return false;
     }
 
-    char port_str[16];
-    snprintf(port_str, sizeof(port_str), "%d", config_.output.port);
-    gst_rtsp_server_set_service(rtsp_server_, port_str);
-
-    // Create our custom factory
-    GstRTSPMediaFactory* factory = encoder_factory_new(this);
-    if (!factory) {
-        std::cerr << "[RTSP-SERVER] Failed to create factory" << std::endl;
-        g_object_unref(rtsp_server_);
-        rtsp_server_ = nullptr;
-        return false;
-    }
-
-    // Mount it
-    GstRTSPMountPoints* mounts = gst_rtsp_server_get_mount_points(rtsp_server_);
-    gst_rtsp_mount_points_add_factory(mounts, config_.output.path.c_str(), factory);
-    g_object_unref(mounts);
-
-    // Attach to main context
-    server_source_id_ = gst_rtsp_server_attach(rtsp_server_, NULL);
-    if (server_source_id_ == 0) {
-        std::cerr << "[RTSP-SERVER] Failed to attach server" << std::endl;
-        g_object_unref(rtsp_server_);
-        rtsp_server_ = nullptr;
-        return false;
-    }
-
-    std::cout << "[RTSP-SERVER] Listening on port " << config_.output.port
-              << ", path: " << config_.output.path << std::endl;
-    std::cout << "[RTSP-SERVER] URL: rtsp://localhost:" << config_.output.port
-              << config_.output.path << std::endl;
-
-    return true;
-}
-
-void Pipeline::stop_rtsp_server() {
-    if (server_source_id_ > 0) {
-        g_source_remove(server_source_id_);
-        server_source_id_ = 0;
-    }
-    if (rtsp_server_) {
-        g_object_unref(rtsp_server_);
-        rtsp_server_ = nullptr;
-    }
-}
-
-// ============================================================================
-//  Public Interface
-// ============================================================================
-
-bool Pipeline::start() {
-    if (running_.load()) {
-        std::cerr << "[PIPELINE] Already running" << std::endl;
-        return false;
-    }
-
-    // 1. Build and start the encoder pipeline
-    if (!build_encoder_pipeline()) {
-        std::cerr << "[PIPELINE] Failed to build encoder pipeline" << std::endl;
-        return false;
-    }
-
-    // Set encoder pipeline to PLAYING
     GstStateChangeReturn ret = gst_element_set_state(enc_pipeline_, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
-        std::cerr << "[PIPELINE] Failed to start encoder pipeline" << std::endl;
-        stop_encoder();
-        return false;
-    }
-
-    std::cout << "[ENCODER] Pipeline state → PLAYING" << std::endl;
-
-    // 2. Start RTSP server
-    if (!start_rtsp_server()) {
-        std::cerr << "[PIPELINE] Failed to start RTSP server" << std::endl;
+        LOG("[PIPELINE] Failed to set PLAYING");
         stop_encoder();
         return false;
     }
@@ -434,38 +282,90 @@ bool Pipeline::start() {
     stats_.reset();
     reconnect_delay_s_ = config_.rtsp.reconnect_delay_s;
 
-    std::cout << "============================================" << std::endl;
-    std::cout << "  Pipeline RUNNING" << std::endl;
-    std::cout << "  RTSP source:  " << config_.rtsp.url << std::endl;
-    std::cout << "  RTSP output:  rtsp://localhost:" << config_.output.port
-              << config_.output.path << std::endl;
-    std::cout << "  go2rtc UI:    http://localhost:1984" << std::endl;
-    std::cout << "============================================" << std::endl;
+    LOG("============================================");
+    LOG("  Pipeline RUNNING (stdout mode)");
+    LOG("  Source: " << config_.rtsp.url);
+    LOG("  Output: stdout (H.264 byte-stream)");
+    LOG("============================================");
 
     return true;
 }
 
-void Pipeline::stop() {
-    if (!running_.load()) return;
+bool Pipeline::restart_stdout() {
+    int max_restarts = config_.resilience.max_pipeline_restarts;
+    uint32_t current = stats_.restart_count();
+    if (max_restarts > 0 && static_cast<int>(current) >= max_restarts) {
+        LOG("[PIPELINE] Max restarts reached"); return false;
+    }
 
-    std::cout << "[PIPELINE] Stopping..." << std::endl;
-    running_.store(false);
+    stats_.on_pipeline_restart();
+    LOG("[PIPELINE] Restarting (attempt #" << stats_.restart_count()
+        << "), wait " << reconnect_delay_s_ << "s...");
+
+    std::this_thread::sleep_for(std::chrono::seconds(reconnect_delay_s_));
+    reconnect_delay_s_ = std::min(reconnect_delay_s_ * 2, 30);
+
     stop_encoder();
-    stop_rtsp_server();
-    std::cout << "[PIPELINE] Stopped" << std::endl;
+
+    if (!build_stdout_pipeline()) { LOG("[PIPELINE] Rebuild failed"); return false; }
+
+    GstStateChangeReturn ret = gst_element_set_state(enc_pipeline_, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        LOG("[PIPELINE] Restart PLAYING failed");
+        stop_encoder(); return false;
+    }
+
+    stats_.reset();
+    reconnect_delay_s_ = config_.rtsp.reconnect_delay_s;
+    LOG("[PIPELINE] Restarted OK");
+    return true;
 }
 
-bool Pipeline::watchdog_check() {
-    if (!running_.load()) return false;
+// ============================================================================
+//  RTSP SERVER MODE
+// ============================================================================
 
-    double since_last = stats_.seconds_since_last_frame();
-    uint64_t frames = stats_.frame_count();
+bool Pipeline::build_encoder_pipeline() {
+    GstElement* sink = gst_element_factory_make("appsink", "enc_sink");
+    if (!sink) { LOG("[ENCODER] Failed to create appsink"); return false; }
 
-    if (since_last > static_cast<double>(config_.resilience.watchdog_timeout_s) && frames > 0) {
-        std::cerr << "[WATCHDOG] No frames for " << since_last
-                  << "s — triggering encoder restart" << std::endl;
-        return false;
+    GstCaps* caps = gst_caps_from_string("video/x-h264,stream-format=byte-stream,alignment=au");
+    g_object_set(G_OBJECT(sink),
+        "emit-signals", FALSE, "sync", FALSE,
+        "max-buffers", (guint)3, "drop", TRUE, "caps", caps, NULL);
+    gst_caps_unref(caps);
+    appsink_ = sink;
+
+    return build_pipeline_common(enc_pipeline_, sink);
+}
+
+bool Pipeline::start() {
+    if (running_.load()) { LOG("[PIPELINE] Already running"); return false; }
+
+    stdout_mode_ = false;
+
+    if (!build_encoder_pipeline()) {
+        LOG("[PIPELINE] Failed to build encoder pipeline"); return false;
     }
+
+    GstStateChangeReturn ret = gst_element_set_state(enc_pipeline_, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        LOG("[PIPELINE] Failed to start"); stop_encoder(); return false;
+    }
+
+    if (!start_rtsp_server()) {
+        LOG("[PIPELINE] Failed to start RTSP server"); stop_encoder(); return false;
+    }
+
+    running_.store(true);
+    stats_.reset();
+    reconnect_delay_s_ = config_.rtsp.reconnect_delay_s;
+
+    LOG("============================================");
+    LOG("  Pipeline RUNNING (RTSP server mode)");
+    LOG("  Source:  " << config_.rtsp.url);
+    LOG("  Output:  rtsp://localhost:" << config_.output.port << config_.output.path);
+    LOG("============================================");
 
     return true;
 }
@@ -473,37 +373,89 @@ bool Pipeline::watchdog_check() {
 bool Pipeline::restart_encoder() {
     int max_restarts = config_.resilience.max_pipeline_restarts;
     uint32_t current = stats_.restart_count();
-
     if (max_restarts > 0 && static_cast<int>(current) >= max_restarts) {
-        std::cerr << "[PIPELINE] Max restarts reached (" << max_restarts << ")" << std::endl;
-        return false;
+        LOG("[PIPELINE] Max restarts reached"); return false;
     }
 
     stats_.on_pipeline_restart();
-    std::cout << "[PIPELINE] Restarting encoder (attempt #" << stats_.restart_count()
-              << "), waiting " << reconnect_delay_s_ << "s..." << std::endl;
+    LOG("[PIPELINE] Restarting encoder (attempt #" << stats_.restart_count() << ")...");
 
     std::this_thread::sleep_for(std::chrono::seconds(reconnect_delay_s_));
     reconnect_delay_s_ = std::min(reconnect_delay_s_ * 2, 30);
 
-    // Only restart the encoder, keep RTSP server running
     stop_encoder();
 
-    if (!build_encoder_pipeline()) {
-        std::cerr << "[PIPELINE] Failed to rebuild encoder" << std::endl;
-        return false;
-    }
+    if (!build_encoder_pipeline()) { LOG("[PIPELINE] Rebuild failed"); return false; }
 
     GstStateChangeReturn ret = gst_element_set_state(enc_pipeline_, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
-        std::cerr << "[PIPELINE] Failed to restart encoder to PLAYING" << std::endl;
-        stop_encoder();
-        return false;
+        LOG("[PIPELINE] Restart PLAYING failed"); stop_encoder(); return false;
     }
 
     stats_.reset();
     reconnect_delay_s_ = config_.rtsp.reconnect_delay_s;
-    std::cout << "[PIPELINE] Encoder restarted successfully" << std::endl;
+    LOG("[PIPELINE] Encoder restarted OK");
+    return true;
+}
+
+bool Pipeline::start_rtsp_server() {
+    rtsp_server_ = gst_rtsp_server_new();
+    if (!rtsp_server_) { LOG("[RTSP-SERVER] Failed to create"); return false; }
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", config_.output.port);
+    gst_rtsp_server_set_service(rtsp_server_, port_str);
+
+    GstRTSPMediaFactory* factory = encoder_factory_new(this);
+    GstRTSPMountPoints* mounts = gst_rtsp_server_get_mount_points(rtsp_server_);
+    gst_rtsp_mount_points_add_factory(mounts, config_.output.path.c_str(), factory);
+    g_object_unref(mounts);
+
+    server_source_id_ = gst_rtsp_server_attach(rtsp_server_, NULL);
+    if (server_source_id_ == 0) {
+        LOG("[RTSP-SERVER] Failed to attach");
+        g_object_unref(rtsp_server_); rtsp_server_ = nullptr;
+        return false;
+    }
+
+    LOG("[RTSP-SERVER] rtsp://localhost:" << config_.output.port << config_.output.path);
+    return true;
+}
+
+// ============================================================================
+//  Common
+// ============================================================================
+
+void Pipeline::stop() {
+    if (!running_.load()) return;
+    LOG("[PIPELINE] Stopping...");
+    running_.store(false);
+    stop_encoder();
+    stop_rtsp_server();
+    LOG("[PIPELINE] Stopped");
+}
+
+void Pipeline::stop_encoder() {
+    if (enc_pipeline_) {
+        gst_element_set_state(enc_pipeline_, GST_STATE_NULL);
+        if (enc_bus_) { gst_bus_remove_watch(enc_bus_); gst_object_unref(enc_bus_); enc_bus_ = nullptr; }
+        appsink_ = nullptr;
+        gst_object_unref(enc_pipeline_); enc_pipeline_ = nullptr;
+    }
+}
+
+void Pipeline::stop_rtsp_server() {
+    if (server_source_id_ > 0) { g_source_remove(server_source_id_); server_source_id_ = 0; }
+    if (rtsp_server_) { g_object_unref(rtsp_server_); rtsp_server_ = nullptr; }
+}
+
+bool Pipeline::watchdog_check() {
+    if (!running_.load()) return false;
+    double since = stats_.seconds_since_last_frame();
+    if (since > static_cast<double>(config_.resilience.watchdog_timeout_s) && stats_.frame_count() > 0) {
+        LOG("[WATCHDOG] No frames for " << since << "s");
+        return false;
+    }
     return true;
 }
 
@@ -524,94 +476,72 @@ std::string Pipeline::get_caps_string() const {
 }
 
 // ============================================================================
-//  GStreamer Callbacks
+//  Callbacks
 // ============================================================================
 
-void Pipeline::on_pad_added(GstElement* /*src*/, GstPad* new_pad, gpointer user_data) {
+void Pipeline::on_pad_added(GstElement*, GstPad* new_pad, gpointer user_data) {
     GstElement* depay = static_cast<GstElement*>(user_data);
 
-    // Only link video pads (ignore audio or other)
-    GstCaps* pad_caps = gst_pad_get_current_caps(new_pad);
-    if (!pad_caps) {
-        pad_caps = gst_pad_query_caps(new_pad, NULL);
-    }
+    GstCaps* caps = gst_pad_get_current_caps(new_pad);
+    if (!caps) caps = gst_pad_query_caps(new_pad, NULL);
 
-    if (pad_caps) {
-        GstStructure* s = gst_caps_get_structure(pad_caps, 0);
+    if (caps) {
+        GstStructure* s = gst_caps_get_structure(caps, 0);
         const gchar* media_type = gst_structure_get_name(s);
 
         if (g_str_has_prefix(media_type, "application/x-rtp")) {
-            // Check if this is a video RTP stream
             const gchar* encoding = gst_structure_get_string(s, "encoding-name");
-            if (encoding && (g_strcmp0(encoding, "H264") == 0)) {
+            if (encoding && g_strcmp0(encoding, "H264") == 0) {
                 GstPad* sink_pad = gst_element_get_static_pad(depay, "sink");
                 if (sink_pad && !gst_pad_is_linked(sink_pad)) {
                     GstPadLinkReturn ret = gst_pad_link(new_pad, sink_pad);
                     if (ret == GST_PAD_LINK_OK) {
-                        std::cout << "[ENCODER] Linked rtspsrc → rtph264depay (H.264 stream found)"
-                                  << std::endl;
+                        LOG("[ENCODER] Linked rtspsrc → depay (H.264 found)");
                     } else {
-                        std::cerr << "[ENCODER] Failed to link rtspsrc → depay: "
-                                  << ret << std::endl;
+                        LOG("[ENCODER] Link failed: rtspsrc → depay: " << ret);
                     }
                 }
                 if (sink_pad) gst_object_unref(sink_pad);
             }
         }
-
-        gst_caps_unref(pad_caps);
+        gst_caps_unref(caps);
     }
 }
 
-gboolean Pipeline::on_bus_message(GstBus* /*bus*/, GstMessage* msg, gpointer data) {
+gboolean Pipeline::on_bus_message(GstBus*, GstMessage* msg, gpointer data) {
     Pipeline* self = static_cast<Pipeline*>(data);
 
     switch (GST_MESSAGE_TYPE(msg)) {
         case GST_MESSAGE_ERROR: {
-            GError* err = nullptr;
-            gchar* debug = nullptr;
+            GError* err = nullptr; gchar* debug = nullptr;
             gst_message_parse_error(msg, &err, &debug);
-
-            std::cerr << "[ENCODER] ERROR: " << (err ? err->message : "unknown") << std::endl;
-            if (debug) {
-                std::cerr << "[ENCODER] Debug: " << debug << std::endl;
-                g_free(debug);
-            }
+            LOG("[ENCODER] ERROR: " << (err ? err->message : "unknown"));
+            if (debug) { LOG("[ENCODER] Debug: " << debug); g_free(debug); }
             if (err) g_error_free(err);
-
             self->stats_.on_reconnect();
             break;
         }
-
         case GST_MESSAGE_WARNING: {
-            GError* err = nullptr;
-            gchar* debug = nullptr;
+            GError* err = nullptr; gchar* debug = nullptr;
             gst_message_parse_warning(msg, &err, &debug);
-            std::cerr << "[ENCODER] WARNING: " << (err ? err->message : "unknown") << std::endl;
+            LOG("[ENCODER] WARNING: " << (err ? err->message : "unknown"));
             if (debug) g_free(debug);
             if (err) g_error_free(err);
             break;
         }
-
         case GST_MESSAGE_EOS:
-            std::cout << "[ENCODER] End of stream — will restart" << std::endl;
+            LOG("[ENCODER] EOS — will restart");
             self->stats_.on_reconnect();
             break;
-
-        case GST_MESSAGE_STATE_CHANGED: {
+        case GST_MESSAGE_STATE_CHANGED:
             if (GST_MESSAGE_SRC(msg) == GST_OBJECT(self->enc_pipeline_)) {
-                GstState old_state, new_state, pending;
-                gst_message_parse_state_changed(msg, &old_state, &new_state, &pending);
-                std::cout << "[ENCODER] State: "
-                          << gst_element_state_get_name(old_state) << " → "
-                          << gst_element_state_get_name(new_state) << std::endl;
+                GstState old_s, new_s, pending;
+                gst_message_parse_state_changed(msg, &old_s, &new_s, &pending);
+                LOG("[ENCODER] State: " << gst_element_state_get_name(old_s)
+                    << " → " << gst_element_state_get_name(new_s));
             }
             break;
-        }
-
-        default:
-            break;
+        default: break;
     }
-
     return TRUE;
 }

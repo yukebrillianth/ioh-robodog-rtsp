@@ -12,17 +12,18 @@
 #include <mutex>
 #include <string>
 
-/// Manages two GStreamer pipelines bridged via appsink→appsrc:
+/// GStreamer pipeline for RTSP re-encoding with NVIDIA NVENC.
 ///
-///   Pipeline 1 (Encoder - always running):
-///     rtspsrc → rtph264depay → h264parse → nvv4l2decoder → nvvidconv
-///     → nvv4l2h264enc (CBR) → h264parse → appsink
+/// Two output modes:
 ///
-///   Pipeline 2 (RTSP Server - on demand):
-///     GstRTSPServer factory: appsrc → h264parse → rtph264pay
+///   STDOUT MODE (default, lowest latency):
+///     rtspsrc → depay → parse → nvv4l2decoder → nvvidconv
+///     → nvv4l2h264enc → h264parse → fdsink(stdout)
+///     Used with go2rtc exec: for zero intermediate buffering.
 ///
-/// This split is necessary because rtspsrc uses dynamic pads that
-/// don't work reliably inside a GstRTSPServer factory launch string.
+///   RTSP SERVER MODE (--rtsp flag):
+///     Same encoder pipeline → appsink → feeder → appsrc
+///     → GstRTSPServer → clients
 
 class Pipeline {
 public:
@@ -32,31 +33,22 @@ public:
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
 
-    /// Build and start both pipelines.
+    // ---- Stdout mode (lowest latency, for go2rtc exec:) ----
+    bool start_stdout_mode();
+    bool restart_stdout();
+
+    // ---- RTSP server mode ----
     bool start();
-
-    /// Stop everything.
-    void stop();
-
-    /// Check if pipeline is running.
-    bool is_running() const { return running_.load(); }
-
-    /// Run watchdog check. Returns true if healthy.
-    bool watchdog_check();
-
-    /// Restart the encoder pipeline (keeps RTSP server running).
     bool restart_encoder();
 
-    /// Update bitrate at runtime.
+    void stop();
+    bool is_running() const { return running_.load(); }
+    bool watchdog_check();
     void set_bitrate(uint32_t target_kbps, uint32_t max_kbps);
 
-    /// Pull a sample from the encoder (used by RTSP server feeder).
+    // For RTSP server feeder
     GstSample* pull_latest_sample();
-
-    /// Get the cached caps string for appsrc.
     std::string get_caps_string() const;
-
-    /// Check if we have valid caps from the encoder.
     bool has_caps() const { return has_caps_.load(); }
 
 private:
@@ -64,47 +56,39 @@ private:
     Stats& stats_;
     Encoder encoder_;
 
-    // ---- Encoder Pipeline ----
     GstElement* enc_pipeline_ = nullptr;
-    GstElement* appsink_ = nullptr;
+    GstElement* appsink_ = nullptr;  // Only used in RTSP mode
     GstBus* enc_bus_ = nullptr;
 
-    // ---- RTSP Server ----
+    // RTSP server (only used in RTSP mode)
     GstRTSPServer* rtsp_server_ = nullptr;
     guint server_source_id_ = 0;
 
-    // ---- State ----
     std::atomic<bool> running_{false};
     std::atomic<bool> has_caps_{false};
+    bool stdout_mode_ = false;
     std::mutex mutex_;
     std::string caps_string_;
-
     int reconnect_delay_s_ = 3;
 
-    /// Build the encoder pipeline with individual elements.
+    // Build pipeline for stdout output (fdsink)
+    bool build_stdout_pipeline();
+
+    // Build pipeline for RTSP server output (appsink)
     bool build_encoder_pipeline();
 
-    /// Start the RTSP server with a custom factory.
+    // Shared element creation
+    bool build_pipeline_common(GstElement*& pipeline, GstElement* sink_element);
+
     bool start_rtsp_server();
-
-    /// Stop encoder pipeline.
     void stop_encoder();
-
-    /// Stop RTSP server.
     void stop_rtsp_server();
 
-    // ---- GStreamer Callbacks ----
-    /// Called when rtspsrc creates a new dynamic pad — links to rtph264depay.
     static void on_pad_added(GstElement* src, GstPad* new_pad, gpointer depay);
-
-    /// Handle bus messages (error, EOS, state changes).
     static gboolean on_bus_message(GstBus* bus, GstMessage* msg, gpointer data);
 };
 
-// ============================================================================
-// Custom RTSP Media Factory
-// ============================================================================
-
+// Custom RTSP Media Factory (only used in RTSP mode)
 #define TYPE_ENCODER_FACTORY (encoder_factory_get_type())
 G_DECLARE_FINAL_TYPE(EncoderFactory, encoder_factory, ENCODER, FACTORY, GstRTSPMediaFactory)
 

@@ -2,10 +2,15 @@
 // RTSP Re-Encoder for WebRTC via go2rtc
 // Jetson Orin NX — Indosat 5G AI-RAN Demo
 //
-// Ingests RTSP from robot dog camera, re-encodes with NVIDIA NVENC (CBR),
-// and serves as local RTSP for go2rtc to consume and serve as WebRTC.
+// Mode 1 (default): Output H.264 to stdout for go2rtc exec: mode (lowest latency)
+// Mode 2 (--rtsp):  Output via local RTSP server for go2rtc rtsp: mode
 //
-// Usage: ./rtsp_encoder [--config path/to/config.yaml]
+// Usage:
+//   go2rtc exec mode (recommended):
+//     go2rtc.yaml: exec:./rtsp_encoder -c config.yaml#video=h264
+//
+//   Standalone RTSP server mode:
+//     ./rtsp_encoder --rtsp -c config.yaml
 // =============================================================================
 
 #include "config.hpp"
@@ -22,20 +27,13 @@
 #include <unistd.h>
 
 // ============================================================================
-// Globals for signal handling
+// Globals
 // ============================================================================
 
 static std::atomic<bool> g_running{true};
 static GMainLoop* g_main_loop = nullptr;
 
-static void signal_handler(int signum) {
-    const char* sig_name = (signum == SIGINT) ? "SIGINT" : 
-                           (signum == SIGTERM) ? "SIGTERM" : "UNKNOWN";
-    // Using write() for async-signal-safety
-    const char msg[] = "\n[MAIN] Signal received, shutting down gracefully...\n";
-    (void)!write(STDOUT_FILENO, msg, sizeof(msg) - 1);
-    (void)sig_name;
-
+static void signal_handler(int /*signum*/) {
     g_running.store(false);
     if (g_main_loop && g_main_loop_is_running(g_main_loop)) {
         g_main_loop_quit(g_main_loop);
@@ -43,34 +41,38 @@ static void signal_handler(int signum) {
 }
 
 // ============================================================================
-// CLI Argument Parsing
+// CLI Parsing
 // ============================================================================
 
-static std::string parse_config_path(int argc, char* argv[]) {
+struct CliArgs {
     std::string config_path = "config.yaml";
+    bool rtsp_mode = false;  // false = stdout mode (default, low latency)
+};
 
+static CliArgs parse_args(int argc, char* argv[]) {
+    CliArgs args;
     for (int i = 1; i < argc; i++) {
-        if ((std::strcmp(argv[i], "--config") == 0 || 
-             std::strcmp(argv[i], "-c") == 0) && i + 1 < argc) {
-            config_path = argv[i + 1];
+        if ((strcmp(argv[i], "--config") == 0 || strcmp(argv[i], "-c") == 0) && i + 1 < argc) {
+            args.config_path = argv[i + 1];
             i++;
-        } else if (std::strcmp(argv[i], "--help") == 0 || 
-                   std::strcmp(argv[i], "-h") == 0) {
-            std::cout << "RTSP Re-Encoder for Jetson Orin NX" << std::endl;
-            std::cout << std::endl;
-            std::cout << "Usage: " << argv[0] << " [OPTIONS]" << std::endl;
-            std::cout << std::endl;
-            std::cout << "Options:" << std::endl;
-            std::cout << "  -c, --config <path>  Config file path (default: config.yaml)" << std::endl;
-            std::cout << "  -h, --help           Show this help" << std::endl;
-            std::cout << std::endl;
-            std::cout << "Architecture:" << std::endl;
-            std::cout << "  Robot Dog (RTSP) → NVENC Re-encode (CBR) → Local RTSP → go2rtc → WebRTC" << std::endl;
+        } else if (strcmp(argv[i], "--rtsp") == 0) {
+            args.rtsp_mode = true;
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            std::cerr << "RTSP Re-Encoder for Jetson Orin NX" << std::endl;
+            std::cerr << std::endl;
+            std::cerr << "Usage: " << argv[0] << " [OPTIONS]" << std::endl;
+            std::cerr << std::endl;
+            std::cerr << "Modes:" << std::endl;
+            std::cerr << "  (default)    Output H.264 to stdout — use with go2rtc exec:" << std::endl;
+            std::cerr << "  --rtsp       Output via local RTSP server" << std::endl;
+            std::cerr << std::endl;
+            std::cerr << "Options:" << std::endl;
+            std::cerr << "  -c, --config <path>  Config file (default: config.yaml)" << std::endl;
+            std::cerr << "  -h, --help           Show this help" << std::endl;
             exit(0);
         }
     }
-
-    return config_path;
+    return args;
 }
 
 // ============================================================================
@@ -78,126 +80,108 @@ static std::string parse_config_path(int argc, char* argv[]) {
 // ============================================================================
 
 int main(int argc, char* argv[]) {
-    // ---- Banner ----
-    std::cout << "========================================" << std::endl;
-    std::cout << "  RTSP Re-Encoder for WebRTC" << std::endl;
-    std::cout << "  Jetson Orin NX | 5G AI-RAN Demo" << std::endl;
-    std::cout << "  Indosat — Surabaya → Barcelona" << std::endl;
-    std::cout << "========================================" << std::endl;
+    CliArgs args = parse_args(argc, argv);
 
-    // ---- Parse CLI args ----
-    std::string config_path = parse_config_path(argc, argv);
+    // Print banner to stderr (stdout is for video data in exec mode)
+    std::cerr << "========================================" << std::endl;
+    std::cerr << "  RTSP Re-Encoder for WebRTC" << std::endl;
+    std::cerr << "  Jetson Orin NX | 5G AI-RAN Demo" << std::endl;
+    std::cerr << "  Mode: " << (args.rtsp_mode ? "RTSP Server" : "Stdout (go2rtc exec)") << std::endl;
+    std::cerr << "========================================" << std::endl;
 
-    // ---- Load & validate config ----
+    // Load config
     AppConfig config;
     try {
-        config = load_config(config_path);
+        config = load_config(args.config_path);
         validate_config(config);
     } catch (const std::exception& e) {
         std::cerr << "[MAIN] Configuration error: " << e.what() << std::endl;
         return 1;
     }
-    print_config(config);
+    // Print config to stderr
+    print_config_stderr(config);
 
-    // ---- Initialize GStreamer ----
+    // Initialize GStreamer
     gst_init(&argc, &argv);
-    std::cout << "[MAIN] GStreamer initialized: " << gst_version_string() << std::endl;
+    std::cerr << "[MAIN] GStreamer initialized: " << gst_version_string() << std::endl;
 
-    // ---- Setup signal handlers ----
+    // Signal handlers
     struct sigaction sa;
-    std::memset(&sa, 0, sizeof(sa));
+    memset(&sa, 0, sizeof(sa));
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    // ---- Create main loop ----
+    // Main loop
     g_main_loop = g_main_loop_new(NULL, FALSE);
 
-    // ---- Create pipeline ----
+    // Create pipeline
     Stats stats;
     Pipeline pipeline(config, stats);
 
-    if (!pipeline.start()) {
+    bool ok;
+    if (args.rtsp_mode) {
+        ok = pipeline.start();
+    } else {
+        ok = pipeline.start_stdout_mode();
+    }
+
+    if (!ok) {
         std::cerr << "[MAIN] Failed to start pipeline" << std::endl;
         g_main_loop_unref(g_main_loop);
-        gst_deinit();
         return 1;
     }
 
-    // ---- Stats & Watchdog Timer ----
-    // Run stats printing and watchdog in a separate thread so the
-    // GMainLoop can run uninterrupted for RTSP serving
-    std::thread monitor_thread([&]() {
-        auto last_stats_time = std::chrono::steady_clock::now();
-
+    // Stats & watchdog thread (prints to stderr)
+    std::thread monitor([&]() {
+        auto last_stats = std::chrono::steady_clock::now();
         while (g_running.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-
             if (!g_running.load()) break;
 
-            // ---- Stats printing ----
+            // Stats
             if (config.stats.enabled) {
                 auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                    now - last_stats_time).count();
-
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_stats).count();
                 if (elapsed >= config.stats.interval_s) {
-                    stats.print();
-                    last_stats_time = now;
+                    stats.print();  // prints to stderr
+                    last_stats = now;
                 }
             }
 
-            // ---- Watchdog ----
-            // Only restart the encoder pipeline, keep RTSP server running
-            // so go2rtc/clients don't need to reconnect
+            // Watchdog
             if (!pipeline.watchdog_check()) {
-                std::cerr << "[MAIN] Watchdog triggered — restarting encoder" << std::endl;
-
+                std::cerr << "[WATCHDOG] Restarting encoder..." << std::endl;
                 if (g_running.load()) {
-                    if (!pipeline.restart_encoder()) {
-                        std::cerr << "[MAIN] Failed to restart encoder" << std::endl;
-                        g_running.store(false);
-                        g_main_loop_quit(g_main_loop);
+                    if (args.rtsp_mode) {
+                        pipeline.restart_encoder();
                     } else {
-                        std::cout << "[MAIN] Encoder restarted successfully" << std::endl;
+                        pipeline.restart_stdout();
                     }
                 }
             }
         }
     });
 
-    // ---- Run GMainLoop (blocks until quit) ----
-    std::cout << "[MAIN] Running main loop (Ctrl+C to stop)..." << std::endl;
+    std::cerr << "[MAIN] Running (Ctrl+C to stop)..." << std::endl;
     g_main_loop_run(g_main_loop);
 
-    // ---- Cleanup ----
-    std::cout << "[MAIN] Shutting down..." << std::endl;
+    // Cleanup
+    std::cerr << "[MAIN] Shutting down..." << std::endl;
     g_running.store(false);
-
-    if (monitor_thread.joinable()) {
-        monitor_thread.join();
-    }
-
+    if (monitor.joinable()) monitor.join();
     pipeline.stop();
 
-    // Print final stats
-    std::cout << std::endl;
-    std::cout << "[MAIN] === Final Statistics ===" << std::endl;
+    std::cerr << std::endl << "[MAIN] === Final Statistics ===" << std::endl;
     stats.print();
 
     g_main_loop_unref(g_main_loop);
-    g_main_loop = nullptr;
+    std::cerr << "[MAIN] Done." << std::endl;
 
-    // NOTE: Skip gst_deinit() — it blocks indefinitely on Jetson
-    // due to NvMMLite cleanup. Force exit after brief delay.
-    std::cout << "[MAIN] Clean shutdown complete." << std::endl;
-
-    // Force exit in case any detached threads are still blocking
+    // Force exit after 2s (NvMMLite cleanup blocks)
     std::thread([]() {
         std::this_thread::sleep_for(std::chrono::seconds(2));
-        std::cerr << "[MAIN] Force exit (cleanup timeout)" << std::endl;
         _exit(0);
     }).detach();
 

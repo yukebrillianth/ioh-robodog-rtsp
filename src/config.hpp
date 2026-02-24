@@ -57,3 +57,6 @@ void validate_config(const AppConfig& cfg);
 
 /// Print configuration summary to stdout.
 void print_config(const AppConfig& cfg);
+
+/// Print configuration to stderr (for exec mode where stdout = video data).
+void print_config_stderr(const AppConfig& cfg);
