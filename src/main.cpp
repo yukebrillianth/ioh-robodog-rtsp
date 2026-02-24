@@ -189,8 +189,17 @@ int main(int argc, char* argv[]) {
 
     g_main_loop_unref(g_main_loop);
     g_main_loop = nullptr;
-    gst_deinit();
 
+    // NOTE: Skip gst_deinit() — it blocks indefinitely on Jetson
+    // due to NvMMLite cleanup. Force exit after brief delay.
     std::cout << "[MAIN] Clean shutdown complete." << std::endl;
+
+    // Force exit in case any detached threads are still blocking
+    std::thread([]() {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::cerr << "[MAIN] Force exit (cleanup timeout)" << std::endl;
+        _exit(0);
+    }).detach();
+
     return 0;
 }
