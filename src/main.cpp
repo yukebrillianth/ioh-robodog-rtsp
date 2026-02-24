@@ -19,6 +19,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <unistd.h>
 
 // ============================================================================
 // Globals for signal handling
@@ -149,28 +150,18 @@ int main(int argc, char* argv[]) {
             }
 
             // ---- Watchdog ----
+            // Only restart the encoder pipeline, keep RTSP server running
+            // so go2rtc/clients don't need to reconnect
             if (!pipeline.watchdog_check()) {
-                std::cerr << "[MAIN] Watchdog triggered — restarting pipeline" << std::endl;
-                stats.on_pipeline_restart();
-
-                // Stop current pipeline
-                pipeline.stop();
-
-                // Wait before restart (backoff)
-                int delay = config.rtsp.reconnect_delay_s;
-                std::cout << "[MAIN] Waiting " << delay << "s before restart..." << std::endl;
-                
-                for (int i = 0; i < delay && g_running.load(); i++) {
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                }
+                std::cerr << "[MAIN] Watchdog triggered — restarting encoder" << std::endl;
 
                 if (g_running.load()) {
-                    if (!pipeline.start()) {
-                        std::cerr << "[MAIN] Failed to restart pipeline" << std::endl;
+                    if (!pipeline.restart_encoder()) {
+                        std::cerr << "[MAIN] Failed to restart encoder" << std::endl;
                         g_running.store(false);
                         g_main_loop_quit(g_main_loop);
                     } else {
-                        std::cout << "[MAIN] Pipeline restarted successfully" << std::endl;
+                        std::cout << "[MAIN] Encoder restarted successfully" << std::endl;
                     }
                 }
             }

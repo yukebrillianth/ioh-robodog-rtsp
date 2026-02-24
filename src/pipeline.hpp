@@ -5,81 +5,122 @@
 #include "stats.hpp"
 
 #include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+#include <gst/app/gstappsrc.h>
 #include <gst/rtsp-server/rtsp-server.h>
 #include <atomic>
-#include <functional>
 #include <mutex>
 #include <string>
-#include <thread>
+#include <vector>
 
-/// Manages the full GStreamer pipeline:
-///   rtspsrc → decode → nvv4l2h264enc → GstRTSPServer
+/// Manages two GStreamer pipelines bridged via appsink→appsrc:
 ///
-/// Features:
-///   - Hardware-accelerated decode & encode (Jetson NVENC)
-///   - Strict CBR bandwidth control for 5G reliability
-///   - Watchdog: auto-restart if no frames for N seconds
-///   - Auto-reconnect with exponential backoff on RTSP failure
-///   - RTSP server output for go2rtc consumption
+///   Pipeline 1 (Encoder - always running):
+///     rtspsrc → rtph264depay → h264parse → nvv4l2decoder → nvvidconv
+///     → nvv4l2h264enc (CBR) → h264parse → appsink
+///
+///   Pipeline 2 (RTSP Server - on demand):
+///     GstRTSPServer factory: appsrc → h264parse → rtph264pay
+///
+/// This split is necessary because rtspsrc uses dynamic pads that
+/// don't work reliably inside a GstRTSPServer factory launch string.
 
 class Pipeline {
 public:
     Pipeline(const AppConfig& config, Stats& stats);
     ~Pipeline();
 
-    // Non-copyable
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
 
-    /// Build and start the pipeline + RTSP server.
+    /// Build and start both pipelines.
     bool start();
 
-    /// Stop the pipeline and RTSP server.
+    /// Stop everything.
     void stop();
 
     /// Check if pipeline is running.
     bool is_running() const { return running_.load(); }
 
-    /// Run the watchdog check. Returns true if pipeline is healthy.
+    /// Run watchdog check. Returns true if healthy.
     bool watchdog_check();
 
-    /// Restart the pipeline (used by watchdog or error recovery).
-    bool restart();
+    /// Restart the encoder pipeline (keeps RTSP server running).
+    bool restart_encoder();
 
     /// Update bitrate at runtime.
     void set_bitrate(uint32_t target_kbps, uint32_t max_kbps);
+
+    /// Get the latest H.264 sample (for RTSP server factory).
+    /// Returns nullptr if no sample available.
+    GstSample* pull_latest_sample();
+
+    /// Get the cached SPS/PPS caps string for appsrc.
+    std::string get_caps_string() const;
+
+    /// Check if we have valid caps from the encoder.
+    bool has_caps() const { return has_caps_.load(); }
 
 private:
     AppConfig config_;
     Stats& stats_;
     Encoder encoder_;
 
+    // ---- Encoder Pipeline ----
+    GstElement* enc_pipeline_ = nullptr;
+    GstElement* appsink_ = nullptr;
+    GstBus* enc_bus_ = nullptr;
+
+    // ---- RTSP Server ----
     GstRTSPServer* rtsp_server_ = nullptr;
-    GstRTSPMountPoints* mounts_ = nullptr;
-    GstRTSPMediaFactory* factory_ = nullptr;
     guint server_source_id_ = 0;
 
+    // ---- State ----
     std::atomic<bool> running_{false};
-    std::mutex pipeline_mutex_;
+    std::atomic<bool> has_caps_{false};
+    std::mutex mutex_;
+    std::string caps_string_;
 
-    int reconnect_delay_s_ = 3;  // Current reconnect delay (exponential backoff)
+    int reconnect_delay_s_ = 3;
 
-    /// Build the GStreamer launch string for the RTSP factory.
-    std::string build_launch_string() const;
+    /// Build the encoder pipeline.
+    bool build_encoder_pipeline();
 
-    /// Callback: called when media is constructed by the RTSP factory.
-    static void on_media_configure(GstRTSPMediaFactory* factory,
-                                    GstRTSPMedia* media,
-                                    gpointer user_data);
-
-    /// Callback: handle pad-added for identity element (frame counting).
-    static GstPadProbeReturn on_buffer_probe(GstPad* pad,
-                                              GstPadProbeInfo* info,
-                                              gpointer user_data);
-
-    /// Start the GstRTSPServer.
+    /// Start the RTSP server with a custom factory.
     bool start_rtsp_server();
 
-    /// Stop the GstRTSPServer.
+    /// Stop encoder pipeline.
+    void stop_encoder();
+
+    /// Stop RTSP server.
     void stop_rtsp_server();
+
+    // ---- GStreamer Callbacks ----
+    /// Called when rtspsrc creates a new pad (dynamic pad linking).
+    static void on_pad_added(GstElement* src, GstPad* new_pad, gpointer data);
+
+    /// Called when a new sample is available from appsink.
+    static GstFlowReturn on_new_sample(GstAppSink* sink, gpointer data);
+
+    /// Handle bus messages (error, EOS, state changes).
+    static gboolean on_bus_message(GstBus* bus, GstMessage* msg, gpointer data);
 };
+
+// ============================================================================
+// Custom RTSP Media Factory
+// ============================================================================
+
+/// A custom GstRTSPMediaFactory that serves H.264 from our encoder pipeline.
+/// It creates an appsrc-based pipeline and feeds it from the encoder's appsink.
+
+// Forward declare
+#define TYPE_ENCODER_FACTORY (encoder_factory_get_type())
+G_DECLARE_FINAL_TYPE(EncoderFactory, encoder_factory, ENCODER, FACTORY, GstRTSPMediaFactory)
+
+struct _EncoderFactory {
+    GstRTSPMediaFactory parent;
+    Pipeline* pipeline;
+};
+
+GType encoder_factory_get_type(void);
+GstRTSPMediaFactory* encoder_factory_new(Pipeline* pipeline);

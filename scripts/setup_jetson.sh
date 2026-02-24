@@ -70,22 +70,22 @@ make -j$(nproc)
 echo "  ✓ Build complete: ${PROJECT_DIR}/build/rtsp_encoder"
 
 # ---- 4. Install go2rtc ----
-echo ""
-echo "[4/5] Installing go2rtc..."
-GO2RTC_VERSION="1.9.4"
-GO2RTC_ARCH="arm64"  # Jetson Orin NX is ARM64
+# echo ""
+# echo "[4/5] Installing go2rtc..."
+# GO2RTC_VERSION="1.9.4"
+# GO2RTC_ARCH="arm64"  # Jetson Orin NX is ARM64
 
-GO2RTC_BIN="/usr/local/bin/go2rtc"
-if [ -f "${GO2RTC_BIN}" ]; then
-    echo "  go2rtc already installed at ${GO2RTC_BIN}"
-else
-    echo "  Downloading go2rtc v${GO2RTC_VERSION} for ${GO2RTC_ARCH}..."
-    wget -q "https://github.com/AlexxIT/go2rtc/releases/download/v${GO2RTC_VERSION}/go2rtc_linux_${GO2RTC_ARCH}" \
-         -O /tmp/go2rtc
-    sudo chmod +x /tmp/go2rtc
-    sudo mv /tmp/go2rtc "${GO2RTC_BIN}"
-    echo "  ✓ go2rtc installed at ${GO2RTC_BIN}"
-fi
+# GO2RTC_BIN="/usr/local/bin/go2rtc"
+# if [ -f "${GO2RTC_BIN}" ]; then
+#     echo "  go2rtc already installed at ${GO2RTC_BIN}"
+# else
+#     echo "  Downloading go2rtc v${GO2RTC_VERSION} for ${GO2RTC_ARCH}..."
+#     wget -q "https://github.com/AlexxIT/go2rtc/releases/download/v${GO2RTC_VERSION}/go2rtc_linux_${GO2RTC_ARCH}" \
+#          -O /tmp/go2rtc
+#     sudo chmod +x /tmp/go2rtc
+#     sudo mv /tmp/go2rtc "${GO2RTC_BIN}"
+#     echo "  ✓ go2rtc installed at ${GO2RTC_BIN}"
+# fi
 
 # ---- 5. Create systemd services ----
 echo ""
@@ -114,23 +114,23 @@ WantedBy=multi-user.target
 EOF
 
 # go2rtc service
-sudo tee /etc/systemd/system/go2rtc.service > /dev/null << EOF
-[Unit]
-Description=go2rtc WebRTC Server
-After=rtsp-encoder.service
-Wants=rtsp-encoder.service
+# sudo tee /etc/systemd/system/go2rtc.service > /dev/null << EOF
+# [Unit]
+# Description=go2rtc WebRTC Server
+# After=rtsp-encoder.service
+# Wants=rtsp-encoder.service
 
-[Service]
-Type=simple
-ExecStart=${GO2RTC_BIN} -config ${PROJECT_DIR}/go2rtc.yaml
-WorkingDirectory=${PROJECT_DIR}
-Restart=always
-RestartSec=5
-User=$(whoami)
+# [Service]
+# Type=simple
+# ExecStart=${GO2RTC_BIN} -config ${PROJECT_DIR}/go2rtc.yaml
+# WorkingDirectory=${PROJECT_DIR}
+# Restart=always
+# RestartSec=5
+# User=$(whoami)
 
-[Install]
-WantedBy=multi-user.target
-EOF
+# [Install]
+# WantedBy=multi-user.target
+# EOF
 
 sudo systemctl daemon-reload
 echo "  ✓ Services created: rtsp-encoder.service, go2rtc.service"
