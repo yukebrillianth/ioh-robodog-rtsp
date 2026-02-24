@@ -12,18 +12,15 @@
 #include <mutex>
 #include <string>
 
-/// GStreamer pipeline for RTSP re-encoding with NVIDIA NVENC.
+/// RTSP Re-encoder pipeline for Jetson Orin NX.
 ///
-/// Two output modes:
+/// Encoder pipeline (always running):
+///   rtspsrc → rtph264depay → h264parse → nvv4l2decoder → nvvidconv
+///   → nvv4l2h264enc (CBR) → h264parse → appsink
 ///
-///   STDOUT MODE (default, lowest latency):
-///     rtspsrc → depay → parse → nvv4l2decoder → nvvidconv
-///     → nvv4l2h264enc → h264parse → fdsink(stdout)
-///     Used with go2rtc exec: for zero intermediate buffering.
-///
-///   RTSP SERVER MODE (--rtsp flag):
-///     Same encoder pipeline → appsink → feeder → appsrc
-///     → GstRTSPServer → clients
+/// RTSP Server (on-demand per client):
+///   Custom factory: appsrc → h264parse → rtph264pay (name=pay0)
+///   Feeder thread bridges appsink → appsrc
 
 class Pipeline {
 public:
@@ -33,20 +30,14 @@ public:
     Pipeline(const Pipeline&) = delete;
     Pipeline& operator=(const Pipeline&) = delete;
 
-    // ---- Stdout mode (lowest latency, for go2rtc exec:) ----
-    bool start_stdout_mode();
-    bool restart_stdout();
-
-    // ---- RTSP server mode ----
     bool start();
-    bool restart_encoder();
-
     void stop();
     bool is_running() const { return running_.load(); }
     bool watchdog_check();
+    bool restart_encoder();
     void set_bitrate(uint32_t target_kbps, uint32_t max_kbps);
 
-    // For RTSP server feeder
+    // Used by RTSP server feeder thread
     GstSample* pull_latest_sample();
     std::string get_caps_string() const;
     bool has_caps() const { return has_caps_.load(); }
@@ -57,29 +48,19 @@ private:
     Encoder encoder_;
 
     GstElement* enc_pipeline_ = nullptr;
-    GstElement* appsink_ = nullptr;  // Only used in RTSP mode
+    GstElement* appsink_ = nullptr;
     GstBus* enc_bus_ = nullptr;
 
-    // RTSP server (only used in RTSP mode)
     GstRTSPServer* rtsp_server_ = nullptr;
     guint server_source_id_ = 0;
 
     std::atomic<bool> running_{false};
     std::atomic<bool> has_caps_{false};
-    bool stdout_mode_ = false;
     std::mutex mutex_;
     std::string caps_string_;
     int reconnect_delay_s_ = 3;
 
-    // Build pipeline for stdout output (fdsink)
-    bool build_stdout_pipeline();
-
-    // Build pipeline for RTSP server output (appsink)
     bool build_encoder_pipeline();
-
-    // Shared element creation
-    bool build_pipeline_common(GstElement*& pipeline, GstElement* sink_element);
-
     bool start_rtsp_server();
     void stop_encoder();
     void stop_rtsp_server();
@@ -88,7 +69,7 @@ private:
     static gboolean on_bus_message(GstBus* bus, GstMessage* msg, gpointer data);
 };
 
-// Custom RTSP Media Factory (only used in RTSP mode)
+// Custom RTSP Media Factory
 #define TYPE_ENCODER_FACTORY (encoder_factory_get_type())
 G_DECLARE_FINAL_TYPE(EncoderFactory, encoder_factory, ENCODER, FACTORY, GstRTSPMediaFactory)
 
