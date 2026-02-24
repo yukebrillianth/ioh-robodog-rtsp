@@ -84,12 +84,9 @@ static GstElement* encoder_factory_create_element(GstRTSPMediaFactory* factory,
         return nullptr;
     }
 
-    // Ghost pad: expose rtph264pay's src pad as the bin's pad
-    GstPad* src_pad = gst_element_get_static_pad(pay, "src");
-    GstPad* ghost_pad = gst_ghost_pad_new("src", src_pad);
-    gst_pad_set_active(ghost_pad, TRUE);
-    gst_element_add_pad(bin, ghost_pad);
-    gst_object_unref(src_pad);
+    // NOTE: Do NOT manually create ghost pads here.
+    // GstRTSPServer automatically discovers elements named "pay0", "pay1", etc.
+    // and creates the appropriate ghost pads + RTSP streams from them.
 
     // Start a feeder thread: pull from encoder appsink, push to this appsrc
     gst_object_ref(appsrc);
