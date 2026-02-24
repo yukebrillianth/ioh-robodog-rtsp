@@ -1,0 +1,53 @@
+# =============================================================================
+# RTSP Re-Encoder Configuration
+# Jetson Orin NX — 5G AI-RAN Demo (Surabaya → Barcelona)
+# =============================================================================
+
+rtsp:
+  # Source RTSP URL (robot dog camera)
+  url: "rtsp://192.168.1.120:554/test"
+  # Transport protocol: tcp (reliable) or udp (lower latency)
+  # TCP recommended for 5G — prevents packet loss at source
+  transport: "tcp"
+  # Jitter buffer in milliseconds
+  latency_ms: 200
+  # Reconnection settings
+  reconnect_delay_s: 3
+  max_reconnect_attempts: 0 # 0 = unlimited
+
+encoder:
+  # Output resolution (0 = keep source resolution)
+  width: 1280
+  height: 720
+  # Target framerate
+  framerate: 30
+  # Bitrate control — CRITICAL for 5G reliability
+  # max_bitrate_kbps: hard ceiling, never exceeded
+  # target_bitrate_kbps: encoder aims for this (slightly below max)
+  max_bitrate_kbps: 2000 # 2 Mbps max
+  target_bitrate_kbps: 1800 # 1.8 Mbps target
+  # Keyframe interval in frames (lower = faster recovery from packet loss)
+  idr_interval: 30
+  # Encoder preset: UltraLowLatency, LowLatency, HP, HQ
+  preset: "UltraLowLatency"
+  # H.264 profile: baseline, main, high
+  profile: "high"
+  # Rate control: cbr (constant) or vbr (variable)
+  # CBR strongly recommended for 5G
+  control_rate: "cbr"
+
+output:
+  # Local RTSP server settings (for go2rtc to consume)
+  port: 8554
+  path: "/stream"
+
+stats:
+  enabled: true
+  # Print stats every N seconds
+  interval_s: 5
+
+resilience:
+  # Restart pipeline if no frames received for this duration
+  watchdog_timeout_s: 10
+  # Max pipeline restarts (0 = unlimited)
+  max_pipeline_restarts: 0

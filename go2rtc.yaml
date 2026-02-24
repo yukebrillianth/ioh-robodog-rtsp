@@ -1,0 +1,30 @@
+# =============================================================================
+# go2rtc Configuration
+# Consumes the re-encoded local RTSP stream and serves it as WebRTC
+# =============================================================================
+
+streams:
+  robot_dog:
+    - rtsp://127.0.0.1:8554/stream
+
+# WebRTC settings
+webrtc:
+  listen: ":8555"
+  ice_servers:
+    - urls:
+        - stun:stun.l.google.com:19302
+        - stun:stun1.l.google.com:19302
+    # TURN server — REQUIRED for Surabaya→Barcelona NAT traversal
+    # Uncomment and configure with your TURN server credentials:
+    # - urls:
+    #     - turn:your-turn-server.com:3478
+    #   username: "your_username"
+    #   credential: "your_password"
+
+# API for monitoring
+api:
+  listen: ":1984"
+
+# Logging
+log:
+  level: info
